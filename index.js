@@ -1,77 +1,82 @@
 require("dotenv").config();
 
 const fs        = require('fs');
+const path      = require('path');
 const axios     = require('axios');
 const puppeteer = require('puppeteer');
+
+// Configuration constants
+const FILES_DIR = path.join(__dirname, 'files');
 
 const CONFIG = {
     account: {
         email: process.env.ACCOUNT_EMAIL,
         password: process.env.ACCOUNT_PASSWORD
     },
-    file: {
-        cookies: "files/cookies.json",
-        coins_history_latest: "files/coins_history_latest.json"
+    paths: {
+        cookies: path.join(FILES_DIR, "cookies.json"),
+        history: path.join(FILES_DIR, "coins_history_latest.json")
     },
-    check_loop: {
-        active: true, // true = executa em loop | false = executa uma única vez
-        seconds: 60
+    loop: {
+        active: true,
+        interval: 60 // seconds
     },
-    webhook_url: process.env.WEBHOOK_URL
-}
+    webhook: process.env.WEBHOOK_URL
+};
 
-let lastHistoryData = [];
-
-// Salva os cookies de sessão:
+/**
+ * Saves current browser session cookies to a file
+ */
 const saveCookies = async (page) => {
     const cookies = await page.cookies();
-    fs.writeFileSync(CONFIG.file.cookies, JSON.stringify(cookies, null, 2));
-}
+    fs.writeFileSync(CONFIG.paths.cookies, JSON.stringify(cookies, null, 2));
+};
 
-// Carrega os cookies da sessão de login anterior:
+/**
+ * Loads previous session cookies if they exist
+ */
 const loadCookies = async (page) => {
 
-    if (!fs.existsSync(CONFIG.file.cookies)) {
-        console.log("arquivo de cookie não encontrado, realizando o login pela primeira vez...");
+    if (!fs.existsSync(CONFIG.paths.cookies)) {
+        console.log("[INFO] Cookie file not found. Fresh login required.");
         return;
     }
 
-    const cookies = JSON.parse(fs.readFileSync(CONFIG.file.cookies, 'utf8'));
-
-    for (const cookie of cookies) {
-        await page.setCookie(cookie);
+    try {
+        const cookies = JSON.parse(fs.readFileSync(CONFIG.paths.cookies, 'utf8'));
+        for (const cookie of cookies) {
+            await page.setCookie(cookie);
+        }
+        console.log("[INFO] Session cookies loaded successfully.");
+    } catch (err) {
+        console.error("[ERROR] Failed to load cookies:", err.message);
     }
+};
 
-    console.log('cookies carregados com sucesso!');
-}
-
-
-const getCoinsHistoryFormatted = async (rawData) => {
+/**
+ * Formats raw scraped data into structured JSON
+ */
+const formatHistoryData = (rawData) => {
     return rawData.map(item => {
         const description = item.description.trim();
-
         let event    = 'other';
         let sender   = null;
         let receiver = null;
 
-        // Gift
+        // Regex for Gift events
         const giftMatch = description.match(/(.+?)\s+gifted\s+to\s+(.+)/i);
         if (giftMatch) {
             event    = 'gift';
             sender   = giftMatch[1];
             receiver = giftMatch[2];
-        }
-
-        // Market
-        else if (/market/i.test(description)) {
+        } else if (/market/i.test(description)) {
             event = 'market';
         }
 
-        // Type
         const type = item.amount > 0 ? 'deposit' : 'withdrawal';
 
         return {
-            id:       item.id,
+            id: item.id,
             datetime: item.date,
             event,
             type,
@@ -83,147 +88,123 @@ const getCoinsHistoryFormatted = async (rawData) => {
     });
 };
 
-const checkForUpdatesCoinsHistory = async (newHistoryFormatted) => {
+/**
+ * Checks for new records and dispatches to webhook
+ */
+const syncHistoryUpdates = async (newFormattedHistory) => {
+    let oldHistory = [];
+    if (fs.existsSync(CONFIG.paths.history)) {
+        oldHistory = JSON.parse(fs.readFileSync(CONFIG.paths.history));
+    }
 
-    const oldHistory = JSON.parse(fs.readFileSync(CONFIG.file.coins_history_latest));
+    const newItems = newFormattedHistory.filter(item => 
+        !oldHistory.some(old => old.id === item.id)
+    );
 
-    const newItems = newHistoryFormatted.filter(item => !oldHistory.some(old => old.id === item.id));
-
-    if (newItems.length < 1) {
-        console.log('sem novidades');
+    if (newItems.length === 0) {
+        console.log("[INFO] No new updates found.");
         return;
     }
 
-    console.log(`${newItems.length} novo(s) registro(s) encontrado(s):`);
-    console.log(newItems);
+    console.log(`[INFO] ${newItems.length} new records detected.`);
+    
+    // Update local storage
+    fs.writeFileSync(CONFIG.paths.history, JSON.stringify(newFormattedHistory, null, 2));
 
-    fs.writeFileSync(CONFIG.file.coins_history_latest, JSON.stringify(newHistoryFormatted, null, 2));
-    lastHistoryData = newHistoryFormatted;
-
-    if (!CONFIG.webhook_url) {
-        return;
+    if (CONFIG.webhook) {
+        try {
+            await axios.post(CONFIG.webhook, newItems);
+            console.log("[SUCCESS] Dispatched updates to webhook.");
+        } catch (err) {
+            console.error("[ERROR] Webhook dispatch failed:", err.message);
+        }
     }
-
-    try {
-        await axios.post(CONFIG.webhook_url, newItems, { headers: { "Content-Type": "application/json" } });
-    } catch (err) {
-        console.error('erro ao enviar: ', err.message);
-    }
-}
-
+};
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 (async () => {
+    console.log("[START] Initializing scraper...");
 
-    console.log("iniciando...");
-
-    if (!fs.existsSync('./files')) {
-        fs.mkdirSync('./files', { recursive: true });
-        console.log("diretório 'files' criado.");
-    }
-
-    if (!fs.existsSync(`./files/cookies.json`)) {
-        fs.writeFileSync(`./files/cookies.json`, "[]");
-        console.log("arquivo 'cookies.json' criado.");
-    }
-
-    if (!fs.existsSync(`./files/coins_history_latest.json`)) {
-        fs.writeFileSync(`./files/coins_history_latest.json`, "[]");
-        console.log("arquivo 'coins_history_latest.json' criado.");
-    }
-
+    // Ensure environment is ready
+    if (!fs.existsSync(FILES_DIR)) fs.mkdirSync(FILES_DIR, { recursive: true });
     if (!CONFIG.account.email || !CONFIG.account.password) {
-        console.error("❌ Variáveis de ambiente ausentes. Verifique seu arquivo .env e informe todos os dados necessários.");
+        console.error("[CRITICAL] Missing credentials in .env file. Exiting.");
         process.exit(1);
     }
 
     const browser = await puppeteer.launch({
-        args: [
-            "--disable-setuid-sandbox",
-            "--no-sandbox"
-        ],
-        slowMo: 50,
-        headless: true,
-        executablePath: puppeteer.executablePath(),
+        args: ["--disable-setuid-sandbox", "--no-sandbox"],
+        headless: "new"
     });
 
-    const page = await browser.newPage();
+    try {
+        const page = await browser.newPage();
+        await loadCookies(page);
 
-    await loadCookies(page);
+        // Access Auction page to bypass simple Cloudflare checks
+        await page.goto('https://www.tibia.com/charactertrade/?subtopic=ownbids', { waitUntil: 'networkidle2' });
 
-    // 1. Acessa a página "ownbids" para evitar o cloudflare:
-    await page.goto('https://www.tibia.com/charactertrade/?subtopic=ownbids', { waitUntil: 'networkidle2' });
+        const isLoggedOut = await page.$('input[type="submit"][value="Login"]');
 
-    // 2. Verifica se já está logado no site:
-    const isLoggedOut = await page.$('input[type="submit"][value="Login"]');
+        if (isLoggedOut) {
+            console.log("[INFO] User logged out. Starting authentication flow...");
+            
+            await page.waitForSelector('form[action*="redirectlogin"]', { visible: true });
+            await page.evaluate(() => document.querySelector('form[action*="redirectlogin"]').submit());
 
-    if (isLoggedOut) {
-        console.log("Usuário está deslogado. Clicando no botão de login...");
+            await page.waitForSelector('input[name="loginemail"]', { visible: true });
+            await page.type('input[name="loginemail"]', CONFIG.account.email, { delay: 30 });
+            await page.type('input[name="loginpassword"]', CONFIG.account.password, { delay: 30 });
 
-        await page.waitForSelector('form[action="https://www.tibia.com/account/?subtopic=redirectlogin"]', { visible: true, timeout: 90000 });
-        await page.evaluate(() => {
-            document.querySelector('form[action="https://www.tibia.com/account/?subtopic=redirectlogin"]').submit();
-        });
+            await page.evaluate(() => document.querySelector('form#LoginForm').submit());
+            await page.waitForNavigation({ waitUntil: 'networkidle2' });
 
-        await page.waitForSelector('input[name="loginemail"]', { visible: true });
+            await saveCookies(page);
+            console.log("[SUCCESS] Login successful.");
+        }
 
-        console.log("formulário de login carregado, efetuando o login...");
+        // Execution Loop
+        while (CONFIG.loop.active) {
+            try {
+                console.log(`[${new Date().toISOString()}] Checking Tibia Coins history...`);
 
-        await page.type('input[name="loginemail"]', CONFIG.account.email, { delay: 50 });
-        await page.type('input[name="loginpassword"]', CONFIG.account.password, { delay: 50 });
+                await page.goto('https://www.tibia.com/account/?subtopic=accountmanagement&page=tibiacoinshistory', { waitUntil: 'networkidle2' });
+                await page.waitForSelector('td.LabelV150', { timeout: 30000 });
 
-        await page.evaluate(() => {
-            document.querySelector('form#LoginForm').submit();
-        });
+                const rawData = await page.evaluate(() => {
+                    const rows = document.querySelectorAll("table.TableContent tr:not(.LabelH)");
+                    const data = [];
+                    rows.forEach(row => {
+                        const cells = row.querySelectorAll("td");
+                        if (cells.length < 5) return;
 
-        await page.waitForXPath('//div[@class="Text" and normalize-space()="My Bids"]', { visible: true });
+                        data.push({
+                            id: parseInt(cells[0].innerText.trim()),
+                            date: cells[1].innerText.trim().replace(/\u00a0/g, ' '),
+                            description: cells[2].innerText.trim(),
+                            character: cells[3].innerText.trim(),
+                            amount: parseInt(cells[4].innerText.trim().replace(/[^\d+-]/g, ''), 10) || 0
+                        });
+                    });
+                    return data;
+                });
 
-        await saveCookies(page);
+                const history = formatHistoryData(rawData);
+                await syncHistoryUpdates(history);
 
-        console.log("Login efetuado com sucesso!");
-    }
+            } catch (loopErr) {
+                console.error("[ERROR] Loop cycle failed. Retrying next interval:", loopErr.message);
+            }
 
-    // Se já houver dados salvos, carrega:
-    if (fs.existsSync(CONFIG.file.coins_history_latest)) {
-        lastHistoryData = JSON.parse(fs.readFileSync(CONFIG.file.coins_history_latest));
-    }
+            if (!CONFIG.loop.active) break;
+            await sleep(CONFIG.loop.interval * 1000);
+        }
 
-    if (!CONFIG.check_loop.active) {
-        console.log("fim da tarefa");
+    } catch (criticalErr) {
+        console.error("[CRITICAL] Fatal error during execution:", criticalErr.message);
+    } finally {
         await browser.close();
-        return;
-    }
-
-    while (true) {
-        console.log(`[${new Date().toISOString()}] procurando novos dados…`);
-
-        await page.goto('https://www.tibia.com/account/?subtopic=accountmanagement&page=tibiacoinshistory', { waitUntil: 'networkidle2' });
-        await page.waitForSelector('td.LabelV150');
-
-        const result = await page.evaluate(() => {
-            const rows = document.querySelectorAll("table.TableContent tr:not(.LabelH)");
-            const data = [];
-
-            rows.forEach(row => {
-                const cells = row.querySelectorAll("td");
-                if (cells.length < 5) return;
-
-                const id          = parseInt(cells[0].innerText.trim());
-                const date        = cells[1].innerText.trim().replace(/\u00a0/g, ' ');
-                const description = cells[2].innerText.trim();
-                const character   = cells[3].innerText.trim();
-                const amount      = parseInt(cells[4].innerText.trim().replace(/[^\d+-]/g, ''), 10) || 0;
-
-                data.push({ id, date, description, character, amount });
-            });
-
-            return data;
-        });
-
-        const history = await getCoinsHistoryFormatted(result);
-
-        await checkForUpdatesCoinsHistory(history);
-        await sleep(CONFIG.check_loop.seconds * 1000);
+        console.log("[END] Scraper terminated.");
     }
 })();
