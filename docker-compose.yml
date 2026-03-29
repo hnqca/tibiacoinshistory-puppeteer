@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    container_name: tibiacoinshistory-puppeteer
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./files:/usr/src/app/files
+    shm_size: 1gb
+    environment:
+      - NODE_ENV=production
